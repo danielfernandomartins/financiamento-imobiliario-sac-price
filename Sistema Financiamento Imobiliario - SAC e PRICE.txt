@@ -1,0 +1,308 @@
+# Simulador de Financiamento Imobiliário (SAC e Tabela Price)#
+
+Recursos:
+- Cálculo de parcelas para SAC e Price
+- Geração de tabela de amortização mês a mês
+- Amortização extraordinária (reduz prazo ou parcela, conforme sistema)
+- Exportação para CSV
+- Entradas em reais e taxa ao mês (% a.m.) ou ao ano (% a.a.)
+
+Autor: você :)
+Licença: MIT
+"""
+
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+import csv
+import sys
+
+# Precisão e arredondamento financeiro (centavos)
+getcontext().prec = 28
+CENT = Decimal("0.01")
+
+def money(x: Decimal) -> Decimal:
+    return x.quantize(CENT, rounding=ROUND_HALF_UP)
+
+def pct_to_rate(p: Decimal) -> Decimal:
+    """Converte porcentagem (ex: 1.10) em taxa (0.0110)."""
+    return (p / Decimal(100))
+
+def efetiva_mensal_de_nominal_anual(i_aa: Decimal) -> Decimal:
+    """
+    Converte taxa efetiva anual (% a.a.) para efetiva mensal (fórmula exata):
+    i_m = (1 + i_a)^(1/12) - 1
+    """
+    ia = pct_to_rate(i_aa)
+    im = (Decimal(1) + ia) ** (Decimal(1) / Decimal(12)) - Decimal(1)
+    return im
+
+@dataclass
+class Parcela:
+    mes: int
+    saldo_inicial: Decimal
+    amortizacao: Decimal
+    juros: Decimal
+    parcela: Decimal
+    saldo_final: Decimal
+    extra: Decimal = Decimal("0.00")
+
+@dataclass
+class Simulacao:
+    sistema: str               # "PRICE" ou "SAC"
+    principal: Decimal         # Valor financiado
+    taxa_mensal: Decimal       # taxa decimal (ex: 0.0123 = 1,23% a.m.)
+    n_meses: int               # prazo em meses
+    parcelas: List[Parcela]
+    parcela_fixa: Optional[Decimal] = None
+
+def parcela_price(P: Decimal, i: Decimal, n: int) -> Decimal:
+    """Parcela fixa da Tabela Price: A = P * i / (1 - (1+i)^-n)"""
+    if i == 0:
+        return money(P / Decimal(n))
+    fator = (i * P) / (Decimal(1) - (Decimal(1) + i) ** (Decimal(-n)))
+    return money(fator)
+
+def gerar_tabela_price(P: Decimal, i: Decimal, n: int,
+                       amort_extra: Optional[dict] = None) -> Simulacao:
+    """
+    Gera tabela Price. amort_extra: {mes: valor_extra, ...}
+    - Amortização extraordinária reduz prazo (mantém parcela).
+    """
+    amort_extra = amort_extra or {}
+    saldo = P
+    A = parcela_price(P, i, n)
+    parcelas: List[Parcela] = []
+    mes_atual = 1
+    meses_restantes = n
+
+    while saldo > CENT and meses_restantes > 0:
+        juros = money(saldo * i)
+        amort = A - juros
+        if amort < 0:
+            amort = Decimal("0.00")
+        saldo_final = saldo - amort
+
+        extra = money(Decimal(amort_extra.get(mes_atual, 0)))
+        if extra > 0:
+            if extra > saldo_final:
+                extra = saldo_final
+            saldo_final = saldo_final - extra
+
+        parcelas.append(Parcela(
+            mes=mes_atual,
+            saldo_inicial=money(saldo),
+            amortizacao=money(amort),
+            juros=juros,
+            parcela=A,
+            saldo_final=money(saldo_final),
+            extra=extra
+        ))
+
+        saldo = saldo_final
+        mes_atual += 1
+        meses_restantes -= 1
+
+        # Se houve amortização extraordinária, mantemos parcela e reduzimos prazo na prática
+        if saldo <= CENT:
+            break
+
+    return Simulacao(
+        sistema="PRICE",
+        principal=money(P),
+        taxa_mensal=i,
+        n_meses=n,
+        parcelas=parcelas,
+        parcela_fixa=A
+    )
+
+def gerar_tabela_sac(P: Decimal, i: Decimal, n: int,
+                     amort_extra: Optional[dict] = None) -> Simulacao:
+    """
+    Gera tabela SAC. amort_extra: {mes: valor_extra, ...}
+    - Amortização extraordinária reduz a parcela dos meses seguintes (mantém o prazo).
+    """
+    amort_extra = amort_extra or {}
+    saldo = P
+    amort_const = money(P / Decimal(n))
+    parcelas: List[Parcela] = []
+
+    for mes in range(1, n + 1):
+        if saldo <= CENT:
+            break
+
+        juros = money(saldo * i)
+        amort = amort_const
+        if amort > saldo:
+            amort = saldo
+        saldo_final = saldo - amort
+
+        extra = money(Decimal(amort_extra.get(mes, 0)))
+        if extra > 0:
+            if extra > saldo_final:
+                extra = saldo_final
+            saldo_final = saldo_final - extra
+
+        parcela_total = money(juros + amort + extra)
+
+        parcelas.append(Parcela(
+            mes=mes,
+            saldo_inicial=money(saldo),
+            amortizacao=money(amort),
+            juros=juros,
+            parcela=parcela_total,
+            saldo_final=money(saldo_final),
+            extra=extra
+        ))
+
+        saldo = saldo_final
+
+    return Simulacao(
+        sistema="SAC",
+        principal=money(P),
+        taxa_mensal=i,
+        n_meses=n,
+        parcelas=parcelas,
+        parcela_fixa=None
+    )
+
+def imprimir_resumo(sim: Simulacao) -> None:
+    total_juros = sum(p.juros for p in sim.parcelas)
+    total_pago = sum(p.parcela for p in sim.parcelas)
+    print("\n=== RESUMO ===")
+    print(f"Sistema: {sim.sistema}")
+    print(f"Valor financiado: R$ {money(sim.principal)}")
+    print(f"Taxa mensal: {(sim.taxa_mensal*100):.6f}% a.m.")
+    print(f"Prazo: {len(sim.parcelas)} meses (solicitado: {sim.n_meses})")
+    if sim.parcela_fixa:
+        print(f"Parcela fixa (Price): R$ {money(sim.parcela_fixa)}")
+    print(f"Total de juros: R$ {money(total_juros)}")
+    print(f"Total pago: R$ {money(total_pago)}")
+
+def imprimir_tabela(sim: Simulacao, limitar_primeiros: Optional[int] = 12) -> None:
+    print("\n=== TABELA DE AMORTIZAÇÃO ===")
+    cab = f"{'Mes':>3} | {'Saldo Inicial':>14} | {'Juros':>10} | {'Amort.':>10} | {'Extra':>10} | {'Parcela':>10} | {'Saldo Final':>12}"
+    print(cab)
+    print("-" * len(cab))
+    linhas = sim.parcelas if not limitar_primeiros else sim.parcelas[:limitar_primeiros]
+    for p in linhas:
+        print(f"{p.mes:>3} | {money(p.saldo_inicial):>14} | {money(p.juros):>10} | "
+              f"{money(p.amortizacao):>10} | {money(p.extra):>10} | {money(p.parcela):>10} | {money(p.saldo_final):>12}")
+    if limitar_primeiros and len(sim.parcelas) > limitar_primeiros:
+        print(f"... ({len(sim.parcelas)-limitar_primeiros} linhas ocultas)")
+
+def exportar_csv(sim: Simulacao, caminho: str) -> None:
+    campos = ["mes", "saldo_inicial", "juros", "amortizacao", "extra", "parcela", "saldo_final"]
+    with open(caminho, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=campos, delimiter=";")
+        w.writeheader()
+        for p in sim.parcelas:
+            row = {
+                "mes": p.mes,
+                "saldo_inicial": f"{money(p.saldo_inicial)}",
+                "juros": f"{money(p.juros)}",
+                "amortizacao": f"{money(p.amortizacao)}",
+                "extra": f"{money(p.extra)}",
+                "parcela": f"{money(p.parcela)}",
+                "saldo_final": f"{money(p.saldo_final)}",
+            }
+            w.writerow(row)
+    print(f"Arquivo CSV salvo em: {caminho}")
+
+def ler_decimal(prompt: str) -> Decimal:
+    while True:
+        try:
+            val = input(prompt).strip().replace(",", ".")
+            d = Decimal(val)
+            if d < 0:
+                raise ValueError
+            return d
+        except Exception:
+            print("Valor inválido. Tente novamente.")
+
+def ler_int(prompt: str, minimo: int = 1) -> int:
+    while True:
+        try:
+            v = int(input(prompt).strip())
+            if v < minimo:
+                raise ValueError
+            return v
+        except Exception:
+            print("Valor inválido. Tente novamente.")
+
+def montar_amort_extra() -> dict:
+    extras = {}
+    print("\nDeseja informar amortizações extraordinárias? (s/N)")
+    if input("> ").strip().lower().startswith("s"):
+        print("Informe linhas no formato: MES;VALOR (ex: 12;5000). Vazio para encerrar.")
+        while True:
+            linha = input("Amort extra: ").strip()
+            if not linha:
+                break
+            try:
+                mes_str, val_str = [x.strip() for x in linha.split(";")]
+                mes = int(mes_str)
+                val = Decimal(val_str.replace(",", "."))
+                if mes < 1 or val <= 0:
+                    raise ValueError
+                extras[mes] = val
+            except Exception:
+                print("Formato inválido. Tente novamente.")
+    return extras
+
+def escolher_taxa_mensal() -> Decimal:
+    print("\nInforme a taxa de juros:")
+    print("1) % ao mês (ex: 1.10)")
+    print("2) % ao ano (ex: 14.00) -> converter para mensal")
+    op = input("> ").strip()
+    if op == "2":
+        i_aa = ler_decimal("Taxa anual (% a.a.): ")
+        i_m = efetiva_mensal_de_nominal_anual(i_aa)
+        print(f"Taxa efetiva mensal calculada: {(i_m*100):.6f}% a.m.")
+        return i_m
+    else:
+        i_am = ler_decimal("Taxa mensal (% a.m.): ")
+        return pct_to_rate(i_am)
+
+def main():
+    print("="*60)
+    print("SIMULADOR DE FINANCIAMENTO IMOBILIÁRIO - SAC e PRICE")
+    print("="*60)
+
+    P = ler_decimal("Valor financiado (R$): ")
+    n = ler_int("Prazo (meses): ", minimo=1)
+    i = escolher_taxa_mensal()
+
+    print("\nEscolha o sistema:")
+    print("1) Tabela Price (parcelas fixas, juros maiores no início)")
+    print("2) SAC (amortização constante, parcelas decrescentes)")
+    sistema = input("> ").strip()
+
+    amort_extra = montar_amort_extra()
+
+    if sistema == "2":
+        sim = gerar_tabela_sac(P, i, n, amort_extra=amort_extra)
+    else:
+        sim = gerar_tabela_price(P, i, n, amort_extra=amort_extra)
+
+    imprimir_resumo(sim)
+    imprimir_tabela(sim, limitar_primeiros=24)
+
+    print("\nDeseja exportar a tabela completa para CSV? (s/N)")
+    if input("> ").strip().lower().startswith("s"):
+        caminho = input("Caminho do arquivo (ex: tabela.csv): ").strip()
+        if not caminho:
+            caminho = "tabela.csv"
+        try:
+            exportar_csv(sim, caminho)
+        except Exception as e:
+            print(f"Falha ao salvar CSV: {e}")
+
+    print("\nFim da simulação. Obrigado!")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nOperação cancelada pelo usuário.")
+        sys.exit(0)
